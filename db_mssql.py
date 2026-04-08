@@ -107,6 +107,7 @@ def get_connection(timeout: int = 5) -> pyodbc.Connection:
     """
     conn_str = _build_connection_string(timeout=timeout)
     conn = pyodbc.connect(conn_str, autocommit=False)
+    conn.timeout = timeout  # query/statement timeout (seconds, 0 = no limit)
     return conn
 
 
@@ -169,7 +170,6 @@ def execute(
     """
     with DBConnection(timeout=timeout) as conn:
         cur = conn.cursor()
-        cur.timeout = timeout
         if params is not None:
             cur.execute(query, params)
         else:
@@ -197,7 +197,6 @@ def executemany(
         return
     with DBConnection(timeout=timeout) as conn:
         cur = conn.cursor()
-        cur.timeout = timeout
         cur.executemany(query, list(seq_of_params))
 
 
@@ -212,7 +211,6 @@ def health_ping(timeout: int = 5) -> bool:
     try:
         conn = get_connection(timeout=timeout)
         cur = conn.cursor()
-        cur.timeout = timeout
         cur.execute("SELECT 1")
         return True
     except Exception as e:
