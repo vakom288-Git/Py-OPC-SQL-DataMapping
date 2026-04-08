@@ -107,7 +107,10 @@ def get_connection(timeout: int = 5) -> pyodbc.Connection:
     """
     conn_str = _build_connection_string(timeout=timeout)
     conn = pyodbc.connect(conn_str, autocommit=False)
-    conn.timeout = timeout  # query/statement timeout (seconds, 0 = no limit)
+    # conn.timeout sets the default query timeout for all cursors on this
+    # connection (seconds; 0 = no limit).  pyodbc does not support per-cursor
+    # timeout; use SQL Server query hints (OPTION (QUERYTIMEOUT n)) if needed.
+    conn.timeout = timeout
     return conn
 
 
