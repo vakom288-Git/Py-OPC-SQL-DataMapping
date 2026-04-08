@@ -1,0 +1,2 @@
+asyncua>=1.1.5
+pyodbc>=5.1.0
