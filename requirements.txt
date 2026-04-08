@@ -1,2 +1,2 @@
 asyncua>=1.1.5
-mssql-python>=1.4.0
+pyodbc>=4.0.39
