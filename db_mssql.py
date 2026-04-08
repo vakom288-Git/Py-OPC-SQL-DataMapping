@@ -1,5 +1,5 @@
 """
-db_mssql.py — Unified SQL Server access layer using mssql-python (TDS driver).
+db_mssql.py — Unified SQL Server access layer using pyodbc (ODBC Driver 17/18).
 
 Provides:
   - get_connection()      — open a new connection from DB_CONFIG
@@ -10,79 +10,109 @@ Provides:
 """
 
 import logging
-from contextlib import contextmanager
-from typing import Any, Iterator, Optional, Sequence, Union
+from typing import Any, Optional, Sequence, Union
 
-import mssql_python
+import pyodbc
 
 from opc_tags_list import DB_CONFIG
 
 logger = logging.getLogger("db_mssql")
 
+# Preferred ODBC drivers in priority order (18 first, 17 as fallback).
+_PREFERRED_DRIVERS = [
+    "ODBC Driver 18 for SQL Server",
+    "ODBC Driver 17 for SQL Server",
+]
 
-def _build_kwargs() -> dict:
-    """Convert DB_CONFIG into keyword arguments accepted by mssql_python.connect."""
+
+def _get_driver() -> str:
+    """Return the best available SQL Server ODBC driver name."""
+    available = pyodbc.drivers()
+    for preferred in _PREFERRED_DRIVERS:
+        if preferred in available:
+            return preferred
+    # Fallback: any driver that mentions SQL Server
+    for d in available:
+        if "SQL Server" in d:
+            return d
+    # Default — will raise a clear error at connect time if not installed
+    return _PREFERRED_DRIVERS[0]
+
+
+def _build_connection_string(timeout: int = 5) -> str:
+    """
+    Build an ODBC connection string from DB_CONFIG without modifying DB_CONFIG.
+
+    Mapping of DB_CONFIG keys to ODBC keywords:
+      server + port          -> SERVER=host,port
+      database               -> DATABASE=...
+      user / password        -> UID=... / PWD=...
+      trusted_connection     -> Trusted_Connection=yes  (only when user is empty)
+      trust_server_certificate -> TrustServerCertificate=yes/no
+      encrypt                -> Encrypt=yes/no
+    """
     cfg = DB_CONFIG
+
     server = cfg["server"]
     port = cfg.get("port")
     if port:
         server = f"{server},{port}"
 
-    kwargs: dict[str, Any] = {
-        "server": server,
-        "database": cfg["database"],
-    }
+    parts: list[str] = [
+        f"Driver={{{_get_driver()}}}",
+        f"SERVER={server}",
+        f"DATABASE={cfg['database']}",
+        f"LoginTimeout={timeout}",
+    ]
 
     user = cfg.get("user", "")
     password = cfg.get("password", "")
 
     if user:
-        kwargs["uid"] = user
-    if password:
-        kwargs["pwd"] = password
-
-    trusted = cfg.get("trusted_connection", "")
-    if trusted:
-        kwargs["trusted_connection"] = trusted
+        parts.append(f"UID={user}")
+        parts.append(f"PWD={password}")
+    else:
+        trusted = cfg.get("trusted_connection", "")
+        if trusted:
+            parts.append("Trusted_Connection=yes")
 
     trust_cert = cfg.get("trust_server_certificate", "")
     if trust_cert:
-        kwargs["trustservercertificate"] = trust_cert
+        # Normalise any truthy/falsy value to yes/no
+        parts.append(
+            f"TrustServerCertificate={'yes' if str(trust_cert).lower() in ('yes', '1', 'true') else 'no'}"
+        )
 
     encrypt = cfg.get("encrypt", "")
     if encrypt:
-        kwargs["encrypt"] = encrypt
+        parts.append(
+            f"Encrypt={'yes' if str(encrypt).lower() in ('yes', '1', 'true') else 'no'}"
+        )
 
-    return kwargs
+    return ";".join(parts)
 
 
-def get_connection(timeout: int = 5) -> mssql_python.Connection:
+def get_connection(timeout: int = 5) -> pyodbc.Connection:
     """
-    Create and return a new mssql_python connection from DB_CONFIG.
+    Create and return a new pyodbc connection from DB_CONFIG.
 
     Args:
         timeout: Login/connection timeout in seconds.
 
     Returns:
-        An open mssql_python.Connection.
+        An open pyodbc.Connection (autocommit=False).
 
     Raises:
-        mssql_python.DatabaseError: If the connection cannot be established.
+        pyodbc.Error: If the connection cannot be established.
     """
-    kwargs = _build_kwargs()
-    conn = mssql_python.connect(timeout=timeout, **kwargs)
-
-    # Force DB context (workaround if driver ignores 'database' during login)
-    db = DB_CONFIG.get("database")
-    if db:
-        cur = conn.cursor()
-        cur.execute(f"USE [{db}]")
+    conn_str = _build_connection_string(timeout=timeout)
+    conn = pyodbc.connect(conn_str, autocommit=False)
     return conn
 
 
 class DBConnection:
     """
-    Context-manager wrapper around a mssql_python connection with explicit
+    Context-manager wrapper around a pyodbc connection with explicit
     transaction control.  Commits on clean exit, rolls back on exception.
 
     Usage:
@@ -101,9 +131,9 @@ class DBConnection:
 
     def __init__(self, timeout: int = 5):
         self._timeout = timeout
-        self._conn: Optional[mssql_python.Connection] = None
+        self._conn: Optional[pyodbc.Connection] = None
 
-    def __enter__(self) -> mssql_python.Connection:
+    def __enter__(self) -> pyodbc.Connection:
         self._conn = get_connection(timeout=self._timeout)
         return self._conn
 
@@ -123,33 +153,30 @@ class DBConnection:
 
 def execute(
     query: str,
-    params: Optional[Union[tuple, dict]] = None,
+    params: Optional[Union[tuple, list]] = None,
     timeout: int = 5,
 ) -> list:
     """
     Execute a single T-SQL query and return all result rows.
 
-    Supports arbitrary T-SQL including scalar UDF calls, e.g.:
-        execute("SELECT dbo.MyUdf(?)", (value,))
-        execute("INSERT INTO dbo.T (Col) VALUES (dbo.MyUdf(?))", (value,))
-
     Args:
         query:   T-SQL query string with ? positional placeholders.
-        params:  Tuple or dict of query parameters (None for no parameters).
-        timeout: Query timeout in seconds.
+        params:  Tuple or list of query parameters (None for no parameters).
+        timeout: Query timeout in seconds (applied to the cursor).
 
     Returns:
         List of result rows (empty list for non-SELECT statements).
     """
     with DBConnection(timeout=timeout) as conn:
         cur = conn.cursor()
+        cur.timeout = timeout
         if params is not None:
             cur.execute(query, params)
         else:
             cur.execute(query)
         try:
             return cur.fetchall()
-        except mssql_python.ProgrammingError:
+        except pyodbc.ProgrammingError:
             return []
 
 
@@ -164,12 +191,13 @@ def executemany(
     Args:
         query:          T-SQL query string with ? positional placeholders.
         seq_of_params:  Sequence of parameter tuples/lists.
-        timeout:        Query timeout in seconds.
+        timeout:        Query timeout in seconds (applied to the cursor).
     """
     if not seq_of_params:
         return
     with DBConnection(timeout=timeout) as conn:
         cur = conn.cursor()
+        cur.timeout = timeout
         cur.executemany(query, list(seq_of_params))
 
 
@@ -184,6 +212,7 @@ def health_ping(timeout: int = 5) -> bool:
     try:
         conn = get_connection(timeout=timeout)
         cur = conn.cursor()
+        cur.timeout = timeout
         cur.execute("SELECT 1")
         return True
     except Exception as e:
