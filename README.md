@@ -89,14 +89,27 @@ Measurements are written to SQL Server by calling the stored procedure
 | 1 | `p_ffc_id`    | `int`      | ТЗК identifier — from OPC tag mapping field `id1`  |
 | 2 | `p_msd_id`    | `int`      | Instrument identifier — from OPC tag mapping `id2` |
 | 3 | `p_msr_value` | `float(53)`| Measurement value                                   |
-| 4 | `p_msr_time`  | `datetime` | Measurement time (local naive datetime)             |
+| 4 | `p_msr_time`  | `datetime` | Measurement time (naive UTC datetime by default; see Timestamp handling) |
 
 ### Timestamp handling
 
-The OPC tag `SourceTimestamp` is used as `p_msr_time`.  If the timestamp is
-timezone-aware (e.g., UTC from the OPC server), it is converted to the **local
-system time** and the timezone information is removed before passing to
-`pyodbc`.  The SQL Server then handles the resulting local datetime as-is.
+The OPC tag `SourceTimestamp` is used as `p_msr_time`.
+
+**Environment variables:**
+
+| Variable | Default | Description |
+|---|---|---|
+| `MEASUREMENT_TIME_MODE` | `utc` | Controls the timezone convention for `p_msr_time`. `utc` — send naive UTC to the stored procedure (БДРВ default). `local` — send naive local time in the OPC fixed offset. |
+| `OPC_LOCAL_UTC_OFFSET` | `+00:00` | UTC offset of the OPC server's local clock when `SourceTimestamp` arrives **without** timezone info (naive). Format: `+HH:MM` or `-HH:MM`. Example for UTC+6: `+06:00`. |
+
+**Conversion logic:**
+
+1. If `SourceTimestamp` is **naive** (no `tzinfo`), the offset from
+   `OPC_LOCAL_UTC_OFFSET` is attached (e.g. `+06:00`) to make it offset-aware.
+2. If `SourceTimestamp` is already **timezone-aware**, it is used as-is.
+3. The aware timestamp is then converted to UTC (mode `utc`) or kept in the
+   fixed OPC offset (mode `local`), and `tzinfo` is stripped before passing to
+   `pyodbc`.
 
 No locale-dependent string formatting is used — `p_msr_time` is always passed
 as a Python `datetime` object.
@@ -104,13 +117,19 @@ as a Python `datetime` object.
 ### Example SQL call (for reference only — actual calls are parameterised)
 
 ```sql
-EXEC Sp_msr_value_send 19, 5, 9565, '07.10.2015 18:15:03';
+EXEC Sp_msr_value_send 19, 5, 9565, '2015-10-07 06:15:03';  -- UTC naive
 ```
 
 ### Buffering on failure
 
 If the DB is unreachable when a measurement arrives, the record is saved to
-`buffer/measurements.json` (via `JSONBufferManager.add_measurement`).  When
-the DB becomes available again, buffered measurements are drained in order via
-`bdrv_client.drain_buffer()` — each record is still sent as its own
-transaction through the same `Sp_msr_value_send` procedure.
+`buffer/measurements.json` (via `JSONBufferManager.add_measurement`).
+
+`msr_time` is stored in the buffer as an **ISO-8601 string with an explicit UTC
+offset** (e.g. `2026-04-09T12:00:00+06:00`).  This makes the meaning
+unambiguous regardless of runtime configuration.
+
+When the DB becomes available again, buffered measurements are drained in order
+via `bdrv_client.drain_buffer()` — each record is parsed back into an
+offset-aware `datetime`, converted through the active `MEASUREMENT_TIME_MODE`,
+and sent as its own transaction through the same `Sp_msr_value_send` procedure.

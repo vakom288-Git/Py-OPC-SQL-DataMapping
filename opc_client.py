@@ -344,9 +344,9 @@ async def db_writer_measurements():
                 buffer.start_buffering_session()
                 buffering_active = True
 
-            # Convert ts to local naive ISO-8601 string for buffer serialization
-            local_ts_str = bdrv_client.to_local_naive(source_ts).isoformat()
-            buffer.add_measurement(ffc_id, msd_id, float(value), local_ts_str)
+            # Serialize ts as offset-aware ISO-8601 for unambiguous buffering
+            msr_time_str = bdrv_client.msr_time_to_iso(source_ts)
+            buffer.add_measurement(ffc_id, msd_id, float(value), msr_time_str)
             logger.debug("msr buffered ffc=%s msd=%s: %s", ffc_id, msd_id, e)
         finally:
             msr_queue.task_done()
