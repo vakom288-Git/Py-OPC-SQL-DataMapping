@@ -11,6 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 import time
 
 import db_mssql
+import bdrv_client
 
 ANALOG_TAGS_BY_OPC = {t["opc"]: t for t in ANALOG_TAGS}
 EVENT_TAGS_BY_OPC = {t["opc"]: t for t in EVENT_TAGS}
@@ -23,6 +24,7 @@ last_opc_disconnect_reason = None       # type: str | None
 latest_analog_values = {}
 event_queue = asyncio.Queue()
 analog_queue = asyncio.Queue()
+msr_queue: asyncio.Queue = asyncio.Queue()  # (ffc_id, msd_id, value, source_ts)
 buffer = JSONBufferManager(
     buffer_dir="./buffer",
     max_size_mb=JSON_BUFFER_MAX_MB,
@@ -74,6 +76,12 @@ class SubscriptionHandler:
         node_id = str(node)
         is_good, status = extract_quality(data)
 
+        # Extract OPC source timestamp for measurements
+        try:
+            source_ts = data.monitored_item.Value.SourceTimestamp
+        except Exception:
+            source_ts = None
+
         # --- EVENTS ---
         if node_id in EVENT_TAGS_BY_OPC:
             db_val = None if (val is None or not is_good) else str(val)
@@ -100,12 +108,14 @@ class SubscriptionHandler:
         # deadband=0 -> не фильтруем
         if deadband <= 0:
             await analog_queue.put((node_id, v, True, clip(status)))
+            await msr_queue.put((tag["id1"], tag["id2"], v, source_ts))
             return
 
         prev = safe_float(last_good_analog_values.get(node_id))
         if prev is None or abs(v - prev) >= deadband:
             last_good_analog_values[node_id] = v
             await analog_queue.put((node_id, v, True, clip(status)))
+            await msr_queue.put((tag["id1"], tag["id2"], v, source_ts))
 
 
 async def emit_opc_connection_state(connected: bool, reason: str = ""):
@@ -310,6 +320,38 @@ async def db_writer_analogs():
             analog_queue.task_done()
 
 
+async def db_writer_measurements():
+    """
+    Принимает измерения из msr_queue и отправляет их в SQL Server через
+    Sp_msr_value_send (1 вызов = 1 транзакция).
+    При ошибке буферизует запись и продолжает работу.
+    """
+    global buffer, buffering_active
+
+    loop = asyncio.get_event_loop()
+
+    while True:
+        ffc_id, msd_id, value, source_ts = await msr_queue.get()
+        try:
+            await loop.run_in_executor(
+                db_executor,
+                lambda ffc=ffc_id, msd=msd_id, v=value, ts=source_ts: bdrv_client.send_value(ffc, msd, v, ts),
+            )
+        except Exception as e:
+            if not buffering_active:
+                logger.error(
+                    "❌ Связь с SQL Server потеряна (msr) - буферизация активирована")
+                buffer.start_buffering_session()
+                buffering_active = True
+
+            # Convert ts to local naive ISO-8601 string for buffer serialization
+            local_ts_str = bdrv_client.to_local_naive(source_ts).isoformat()
+            buffer.add_measurement(ffc_id, msd_id, float(value), local_ts_str)
+            logger.debug("msr buffered ffc=%s msd=%s: %s", ffc_id, msd_id, e)
+        finally:
+            msr_queue.task_done()
+
+
 async def periodic_analog_recorder():
     while True:
         await asyncio.sleep(ANALOG_SAVE_INTERVAL)
@@ -354,8 +396,11 @@ async def sync_buffer_to_db():
             continue
 
         stats = buffer.get_stats()
-        unsync_count = stats.get("events_unsynced", 0) + \
-            stats.get("analogs_unsynced", 0)
+        unsync_count = (
+            stats.get("events_unsynced", 0)
+            + stats.get("analogs_unsynced", 0)
+            + stats.get("measurements_unsynced", 0)
+        )
 
         if unsync_count == 0:
             sync_attempts = 0
@@ -372,11 +417,14 @@ async def sync_buffer_to_db():
         try:
             buffer_data = buffer.get_unsync_data(limit=2000)
             if not buffer_data.get("events") and not buffer_data.get("analogs"):
-                logger.warning(
-                    " [СИНХРО] ⚠️ get_unsync_data() вернул пусто при наличии unsync_count. "
-                    "Возможно, файлы буфера повреждены или stats не совпадают с содержимым."
-                )
-                continue
+                # Check if there are buffered measurements to drain
+                msr_records = buffer.get_unsync_measurements(limit=1)
+                if not msr_records:
+                    logger.warning(
+                        " [СИНХРО] ⚠️ get_unsync_data() вернул пусто при наличии unsync_count. "
+                        "Возможно, файлы буфера повреждены или stats не совпадают с содержимым."
+                    )
+                    continue
 
             synced_events = []
             synced_analogs = []
@@ -431,8 +479,16 @@ async def sync_buffer_to_db():
                 logger.info(
                     f" [СИНХРО] ✓ Аналоги: +{len(buffer_data['analogs'])} записей")
 
+            # --- Измерения (1 запись = 1 EXEC Sp_msr_value_send) ---
+            msr_sent = await loop.run_in_executor(
+                db_executor,
+                lambda: bdrv_client.drain_buffer(buffer, limit=2000),
+            )
+            if msr_sent:
+                logger.info(f" [СИНХРО] ✓ Измерения: +{msr_sent} записей")
+
             # Если реально что-то синхронизировали — отмечаем synced и закрываем буфер-сессию
-            if synced_events or synced_analogs:
+            if synced_events or synced_analogs or msr_sent:
                 buffer.mark_synced(event_ids=synced_events,
                                    analog_ids=synced_analogs)
 
@@ -490,6 +546,7 @@ async def monitor_buffer():
             f"Размер: {stats['current_size_mb']}MB/{stats['max_size_mb']}MB ({stats['usage_percent']}%) | "
             f"События: {stats['events_unsynced']}/{stats['events_total']} | "
             f"Аналоги: {stats['analogs_unsynced']}/{stats['analogs_total']} | "
+            f"Измерения: {stats.get('measurements_unsynced', 0)}/{stats.get('measurements_total', 0)} | "
             f"Ротир. файлов: {stats['rotated_files']}"
         )
 
@@ -501,18 +558,20 @@ async def performance_monitor():
 
         event_queue_size = event_queue.qsize()
         analog_queue_size = analog_queue.qsize()
+        msr_queue_size = msr_queue.qsize()
         buffer_stats = buffer.get_stats()
 
         logger.info(
             f" [ПРОИЗВОДИТЕЛЬНОСТЬ] "
             f"Event Queue: {event_queue_size} | "
             f"Analog Queue: {analog_queue_size} | "
+            f"Msr Queue: {msr_queue_size} | "
             f"Buffer: {buffer_stats['current_size_mb']}MB / "
             f"{buffer_stats['max_size_mb']}MB"
         )
 
         # Предупреждение если очередь растет
-        if event_queue_size > 1000 or analog_queue_size > 1000:
+        if event_queue_size > 1000 or analog_queue_size > 1000 or msr_queue_size > 1000:
             logger.warning(" [ПРОИЗВОДИТЕЛЬНОСТЬ] ⚠️ Очередь переполняется!")
 
 
@@ -612,7 +671,8 @@ async def main():
         monitor_buffer(),
         performance_monitor(),
         db_writer_events(),
-        db_writer_analogs(),)
+        db_writer_analogs(),
+        db_writer_measurements(),)
 
 if __name__ == "__main__":
     try:
