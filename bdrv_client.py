@@ -103,10 +103,12 @@ def ensure_aware_opc_ts(ts: Optional[datetime]) -> datetime:
     Return a timezone-aware datetime for an OPC SourceTimestamp.
 
     Rules:
-      - None       → current time in the fixed OPC offset
-                     (or UTC when MEASUREMENT_TIME_MODE='utc' and offset is UTC).
+      - None       → current time in the fixed OPC offset (_FIXED_OFFSET_TZ).
       - tz-aware   → returned unchanged.
       - naive      → tzinfo set to the fixed OPC offset from OPC_LOCAL_UTC_OFFSET.
+
+    Note: this function is mode-independent; MEASUREMENT_TIME_MODE only affects
+    how the resulting aware datetime is later converted in to_db_naive().
 
     Args:
         ts: OPC SourceTimestamp (may be None, naive, or aware).
