@@ -76,3 +76,41 @@ CREATE TABLE example (
     name VARCHAR(100)
 );
 ```
+
+## Stored Procedure: Sp_msr_value_send
+
+Measurements are written to SQL Server by calling the stored procedure
+`Sp_msr_value_send` once per measurement value (one call = one transaction).
+
+### Parameters
+
+| # | Parameter     | Type       | Description                                         |
+|---|---------------|------------|-----------------------------------------------------|
+| 1 | `p_ffc_id`    | `int`      | ТЗК identifier — from OPC tag mapping field `id1`  |
+| 2 | `p_msd_id`    | `int`      | Instrument identifier — from OPC tag mapping `id2` |
+| 3 | `p_msr_value` | `float(53)`| Measurement value                                   |
+| 4 | `p_msr_time`  | `datetime` | Measurement time (local naive datetime)             |
+
+### Timestamp handling
+
+The OPC tag `SourceTimestamp` is used as `p_msr_time`.  If the timestamp is
+timezone-aware (e.g., UTC from the OPC server), it is converted to the **local
+system time** and the timezone information is removed before passing to
+`pyodbc`.  The SQL Server then handles the resulting local datetime as-is.
+
+No locale-dependent string formatting is used — `p_msr_time` is always passed
+as a Python `datetime` object.
+
+### Example SQL call (for reference only — actual calls are parameterised)
+
+```sql
+EXEC Sp_msr_value_send 19, 5, 9565, '07.10.2015 18:15:03';
+```
+
+### Buffering on failure
+
+If the DB is unreachable when a measurement arrives, the record is saved to
+`buffer/measurements.json` (via `JSONBufferManager.add_measurement`).  When
+the DB becomes available again, buffered measurements are drained in order via
+`bdrv_client.drain_buffer()` — each record is still sent as its own
+transaction through the same `Sp_msr_value_send` procedure.

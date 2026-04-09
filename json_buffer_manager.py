@@ -13,6 +13,7 @@ class JSONBufferManager:
     Основные файлы:
       - events.json
       - analogs.json
+      - measurements.json  (записи для Sp_msr_value_send)
       - metadata.json
     """
 
@@ -27,13 +28,14 @@ class JSONBufferManager:
 
         self.events_file = self.buffer_dir / "events.json"
         self.analogs_file = self.buffer_dir / "analogs.json"
+        self.measurements_file = self.buffer_dir / "measurements.json"
         self.metadata_file = self.buffer_dir / "metadata.json"
 
         self._init_files()
 
     def _init_files(self) -> None:
         """Создаёт файлы буфера, если их нет."""
-        for file_path in (self.events_file, self.analogs_file):
+        for file_path in (self.events_file, self.analogs_file, self.measurements_file):
             if not file_path.exists():
                 file_path.write_text(json.dumps(
                     {"records": []}, ensure_ascii=False), encoding="utf-8")
@@ -52,7 +54,7 @@ class JSONBufferManager:
 
     def _get_total_buffer_size(self) -> int:
         total_size = 0
-        for file_path in (self.events_file, self.analogs_file):
+        for file_path in (self.events_file, self.analogs_file, self.measurements_file):
             if file_path.exists():
                 total_size += file_path.stat().st_size
         return total_size
@@ -86,14 +88,11 @@ class JSONBufferManager:
     Обнуляет активные файлы, чтобы сессия начиналась с 0.
         """
         try:
-            self.events_file.write_text(
-                json.dumps({"records": []}, ensure_ascii=False),
-                encoding="utf-8",
-            )
-            self.analogs_file.write_text(
-                json.dumps({"records": []}, ensure_ascii=False),
-                encoding="utf-8",
-            )
+            for file_path in (self.events_file, self.analogs_file, self.measurements_file):
+                file_path.write_text(
+                    json.dumps({"records": []}, ensure_ascii=False),
+                    encoding="utf-8",
+                )
         except Exception as e:
             logger.error(
                 f"[JSON_BUFFER] start_buffering_session error: {e}")
@@ -113,13 +112,17 @@ class JSONBufferManager:
     def close_buffering_session(self) -> Dict[str, str]:
         """
         Вызывается после успешной синхронизации (SQL восстановился и буфер выгружен).
-        Сохраняет events.json/analogs.json в archive_<kind>_<LAST_TS>.json,
+        Сохраняет events.json/analogs.json/measurements.json в archive_<kind>_<LAST_TS>.json,
         затем обнуляет активные файлы.
         Возвращает имена созданных архивов.
         """
         created: Dict[str, str] = {}
         try:
-            for kind, active_path in (("events", self.events_file), ("analogs", self.analogs_file)):
+            for kind, active_path in (
+                ("events", self.events_file),
+                ("analogs", self.analogs_file),
+                ("measurements", self.measurements_file),
+            ):
                 if not active_path.exists():
                     continue
 
@@ -214,6 +217,94 @@ class JSONBufferManager:
         except Exception as e:
             logger.error(f"[JSON_BUFFER] add_analog error: {e}")
             return False
+
+    def add_measurement(
+        self,
+        ffc_id: int,
+        msd_id: int,
+        value: float,
+        msr_time: Optional[str] = None,
+    ) -> bool:
+        """
+        Буферизация одного измерения для последующей отправки через Sp_msr_value_send.
+
+        Args:
+            ffc_id:   id1 из конфига OPC тега (p_ffc_id).
+            msd_id:   id2 из конфига OPC тега (p_msd_id).
+            value:    значение измерения (float).
+            msr_time: время измерения в виде ISO-8601 строки (локальное naive).
+                      Если None — используется текущее время.
+        """
+        if not self.buffer_enabled:
+            return False
+
+        allowed, _ = self._check_buffer_limit()
+        if not allowed:
+            return False
+
+        try:
+            data = json.loads(self.measurements_file.read_text(encoding="utf-8"))
+            now_iso = datetime.now().isoformat()
+            data["records"].append(
+                {
+                    "ffc_id": int(ffc_id),
+                    "msd_id": int(msd_id),
+                    "value": float(value),
+                    "msr_time": msr_time if msr_time is not None else now_iso,
+                    "timestamp": now_iso,
+                    "synced": 0,
+                }
+            )
+            if len(data["records"]) > self.max_records_per_file:
+                data["records"] = data["records"][-self.max_records_per_file:]
+
+            self.measurements_file.write_text(json.dumps(
+                data, ensure_ascii=False), encoding="utf-8")
+            return True
+        except Exception as e:
+            logger.error(f"[JSON_BUFFER] add_measurement error: {e}")
+            return False
+
+    def get_unsync_measurements(self, limit: int = 1000) -> List[Dict]:
+        """
+        Возвращает не более *limit* несинхронизированных записей измерений.
+        """
+        try:
+            data = json.loads(self.measurements_file.read_text(encoding="utf-8"))
+            records = data.get("records", [])
+            return [r for r in records if r.get("synced", 0) == 0][:limit]
+        except Exception as e:
+            logger.error(f"[JSON_BUFFER] get_unsync_measurements error: {e}")
+            return []
+
+    def mark_measurements_synced(self, timestamps: List[str]) -> int:
+        """
+        Помечает записи измерений как synced=1 по их timestamp.
+        Возвращает количество помеченных записей.
+        """
+        if not timestamps or not self.measurements_file.exists():
+            return 0
+        try:
+            data = json.loads(self.measurements_file.read_text(encoding="utf-8"))
+            records = data.get("records", [])
+            ids_set = set(timestamps)
+            marked = 0
+            for r in records:
+                if r.get("synced", 0) == 0 and r.get("timestamp") in ids_set:
+                    r["synced"] = 1
+                    marked += 1
+            if marked:
+                self.measurements_file.write_text(
+                    json.dumps(data, ensure_ascii=False), encoding="utf-8"
+                )
+                try:
+                    self._update_metadata({"last_sync": datetime.now().isoformat()})
+                except Exception:
+                    pass
+            return marked
+        except Exception as e:
+            logger.error(f"[JSON_BUFFER] mark_measurements_synced error: {e}")
+            return 0
 
     def get_unsync_data(self, limit: int = 1000) -> Dict[str, List]:
         result = {"events": [], "analogs": []}
@@ -315,6 +406,7 @@ class JSONBufferManager:
 
         deleted += _cleanup(self.events_file)
         deleted += _cleanup(self.analogs_file)
+        deleted += _cleanup(self.measurements_file)
 
         return deleted
 
@@ -335,6 +427,8 @@ class JSONBufferManager:
             events_total, events_unsynced = _count_unsynced(self.events_file)
             analogs_total, analogs_unsynced = _count_unsynced(
                 self.analogs_file)
+            measurements_total, measurements_unsynced = _count_unsynced(
+                self.measurements_file)
 
             rotated_files = len(list(self.buffer_dir.glob("buffer_*_*.json")))
 
@@ -347,6 +441,8 @@ class JSONBufferManager:
                 "events_unsynced": events_unsynced,
                 "analogs_total": analogs_total,
                 "analogs_unsynced": analogs_unsynced,
+                "measurements_total": measurements_total,
+                "measurements_unsynced": measurements_unsynced,
                 "rotated_files": rotated_files,
             }
         except Exception as e:
@@ -360,6 +456,8 @@ class JSONBufferManager:
                 "events_unsynced": 0,
                 "analogs_total": 0,
                 "analogs_unsynced": 0,
+                "measurements_total": 0,
+                "measurements_unsynced": 0,
                 "rotated_files": 0,
             }
 
