@@ -344,9 +344,10 @@ async def db_writer_measurements():
                 buffer.start_buffering_session()
                 buffering_active = True
 
-            # Convert ts to local naive ISO-8601 string for buffer serialization
-            local_ts_str = bdrv_client.to_local_naive(source_ts).isoformat()
-            buffer.add_measurement(ffc_id, msd_id, float(value), local_ts_str)
+            # Serialize msr_time using the same conversion as send_value() so
+            # drain_buffer() later sends exactly the same datetime value.
+            ts_str = bdrv_client.to_db_naive(source_ts).isoformat()
+            buffer.add_measurement(ffc_id, msd_id, float(value), ts_str)
             logger.debug("msr buffered ffc=%s msd=%s: %s", ffc_id, msd_id, e)
         finally:
             msr_queue.task_done()

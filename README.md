@@ -89,14 +89,36 @@ Measurements are written to SQL Server by calling the stored procedure
 | 1 | `p_ffc_id`    | `int`      | ТЗК identifier — from OPC tag mapping field `id1`  |
 | 2 | `p_msd_id`    | `int`      | Instrument identifier — from OPC tag mapping `id2` |
 | 3 | `p_msr_value` | `float(53)`| Measurement value                                   |
-| 4 | `p_msr_time`  | `datetime` | Measurement time (local naive datetime)             |
+| 4 | `p_msr_time`  | `datetime` | Measurement time — passed in **UTC** by default     |
 
 ### Timestamp handling
 
-The OPC tag `SourceTimestamp` is used as `p_msr_time`.  If the timestamp is
-timezone-aware (e.g., UTC from the OPC server), it is converted to the **local
-system time** and the timezone information is removed before passing to
-`pyodbc`.  The SQL Server then handles the resulting local datetime as-is.
+`p_msr_time` is passed as a naive Python `datetime` object (no `tzinfo`).
+The conversion mode is controlled by the **`MEASUREMENT_TIME_MODE`** environment
+variable:
+
+| Value   | Behaviour                                                        |
+|---------|------------------------------------------------------------------|
+| `utc`   | **(default)** OPC `SourceTimestamp` is converted to UTC before passing to the procedure. BDRV converts UTC to Moscow time internally. |
+| `local` | Timestamp is converted to the local system timezone. Use only if the target procedure does **not** perform its own UTC→local conversion. |
+
+Set the variable before starting the service:
+
+```bash
+# Linux / Astra
+export MEASUREMENT_TIME_MODE=utc   # default — can be omitted
+python opc_client.py
+```
+
+```cmd
+:: Windows
+set MEASUREMENT_TIME_MODE=utc
+python opc_client.py
+```
+
+**Per specification**: "In BDRV all times are stored in Moscow timezone.
+Timestamps in stored procedure parameters called from DCS are specified in UTC.
+The conversion between time zones is performed by BDRV."
 
 No locale-dependent string formatting is used — `p_msr_time` is always passed
 as a Python `datetime` object.
