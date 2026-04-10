@@ -1,0 +1,23 @@
+# Normalize line endings: store as LF in the repository.
+# On checkout, Git will use the system default (LF on Linux/macOS,
+# optionally CRLF on Windows depending on core.autocrlf).
+* text=auto eol=lf
+
+# Explicitly text files that should always be LF
+*.py   text eol=lf
+*.md   text eol=lf
+*.txt  text eol=lf
+*.json text eol=lf
+*.yml  text eol=lf
+*.yaml text eol=lf
+*.ini  text eol=lf
+*.cfg  text eol=lf
+*.toml text eol=lf
+
+# Binary files — no EOL conversion
+*.png  binary
+*.jpg  binary
+*.jpeg binary
+*.ico  binary
+*.gz   binary
+*.zip  binary

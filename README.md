@@ -93,13 +93,30 @@ Measurements are written to SQL Server by calling the stored procedure
 
 ### Timestamp handling
 
-The OPC tag `SourceTimestamp` is used as `p_msr_time`.  If the timestamp is
-timezone-aware (e.g., UTC from the OPC server), it is converted to the **local
-system time** and the timezone information is removed before passing to
-`pyodbc`.  The SQL Server then handles the resulting local datetime as-is.
+The OPC tag `SourceTimestamp` is used as `p_msr_time`.  Timestamps are
+processed by `bdrv_client.py` according to the following rules:
+
+- Timezone-aware timestamps (e.g. UTC from the OPC server) are converted to
+  UTC, and the timezone information is removed before passing to `pyodbc`.
+- Naive timestamps (no timezone info) are first interpreted as OPC-local time
+  (see `OPC_LOCAL_UTC_OFFSET` below), then converted to UTC.
 
 No locale-dependent string formatting is used — `p_msr_time` is always passed
 as a Python `datetime` object.
+
+#### Environment variables for timestamp control
+
+| Variable                | Default | Description |
+|-------------------------|---------|-------------|
+| `MEASUREMENT_TIME_MODE` | `utc`   | Reserved for future timestamp mode selection. Currently timestamps are always stored as UTC naive. |
+| `OPC_LOCAL_UTC_OFFSET`  | *(unset)* | Fixed UTC offset of the OPC server's local clock, e.g. `+06:00` or `-05:30`. When set, naive OPC timestamps are interpreted as OPC-local time with this offset before conversion to UTC. When unset, naive timestamps are interpreted using the system local timezone. |
+
+Example (OPC server is in UTC+6):
+
+```bash
+export OPC_LOCAL_UTC_OFFSET=+06:00
+python opc_client.py
+```
 
 ### Example SQL call (for reference only — actual calls are parameterised)
 
